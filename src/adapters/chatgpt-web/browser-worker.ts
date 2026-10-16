@@ -3307,19 +3307,78 @@ export class ChatGptBrowserWorker {
       let matches = false;
       if (replacement) {
         const locator = page.locator(chatGptAssistantTurnSelector(identity!));
-        matches = baseline.acceptedUserIdentity
-          ? user === baseline.acceptedUserIdentity
-          : Boolean(baseline.submittedText) && await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.evaluate((group, submitted) => {
-          const bubbles = group.querySelectorAll<HTMLElement>("[data-user-message-bubble]");
-          const contents = bubbles.length === 1
-            ? bubbles[0]!.querySelectorAll<HTMLElement>("[data-search-result-target]")
-            : [];
-          const normalize = (text: string) => text.replace(/\r\n?/g, "\n");
-          // The bubble also contains Show more and accessibility spacing. Only its
-          // observed message-content target represents the submitted prompt.
-          return contents.length === 1 && normalize(contents[0]!.innerText) === normalize(submitted);
-        }, baseline.submittedText!), signal));
-        // The accepted user identity (or exact submitted text) establishes ownership.
+        if (baseline.acceptedUserIdentity) {
+          matches = user === baseline.acceptedUserIdentity;
+        } else if (baseline.submittedText) {
+          const comparison = await withChatGptBrowserObservationTimeout(withBrowserTurnAbort(locator.evaluate((group, { submitted, freshConversation }) => {
+            const bubbles = group.querySelectorAll<HTMLElement>("[data-user-message-bubble]");
+            const contents = bubbles.length === 1
+              ? bubbles[0]!.querySelectorAll<HTMLElement>("[data-search-result-target]")
+              : [];
+            if (contents.length !== 1) return { matches: false, renderedChars: -1, submittedChars: submitted.length, commonPrefixChars: 0 };
+            const normalize = (text: string) => text.replace(/\r\n?/g, "\n");
+            // The bubble also contains Show more and accessibility spacing. Only its
+            // observed message-content target represents the submitted prompt.
+            const exact = normalize(contents[0]!.innerText);
+            const expected = normalize(submitted);
+            if (exact === expected) return { matches: true, renderedChars: exact.length, submittedChars: expected.length, commonPrefixChars: exact.length };
+            // A Full-mode prompt is rendered with its selected connector pill inline and its
+            // paragraphs as blocks. Neither is user text; spaces and edges remain exact.
+            const clone = contents[0]!.cloneNode(true) as HTMLElement;
+            clone.querySelectorAll('[data-prompt-link-href], [app-mention-path^="app://"]').forEach(pill => {
+              // The composer separates a pill from the prompt with one space it rendered itself.
+              const next = pill.nextSibling;
+              if (next?.nodeType === Node.TEXT_NODE && next.textContent?.startsWith(" ")) next.textContent = next.textContent.slice(1);
+              pill.remove();
+            });
+            // The inline transport wraps its context JSON in a Markdown code fence, which the
+            // persisted bubble renders as a code block with its own label and copy control.
+            clone.querySelectorAll("pre").forEach(block => {
+              block.replaceWith(document.createTextNode((block.querySelector("code") ?? block).textContent ?? ""));
+            });
+            clone.querySelectorAll("button").forEach(control => control.remove());
+            const host = document.createElement("div");
+            host.style.cssText = "position:fixed;left:-99999px;top:0;white-space:pre-wrap";
+            host.appendChild(clone);
+            document.body.appendChild(host);
+            const blocks = (text: string) => normalize(text).replace(/\n{2,}/g, "\n");
+            const rendered = blocks(clone.innerText);
+            host.remove();
+            const wanted = blocks(submitted);
+            if (rendered === wanted) return { matches: true, renderedChars: rendered.length, submittedChars: wanted.length, commonPrefixChars: rendered.length };
+            // ChatGPT collapses a very long user message once the exchange is persisted (behind
+            // Show more, showing either its head or its tail), and its Markdown composer can
+            // escape backslashes on Send (a JSON "1\\." is shown as "1\\\\."). In a conversation
+            // this turn opened empty, a substantial contiguous fragment of the submitted
+            // prompt's content (ignoring fence markers, layout whitespace and escape
+            // backslashes) identifies it; a tail also carries this turn's unique token. A
+            // longer or reworded message does not match.
+            const content = (text: string) => text.replace(/^```[^\n]*$/gm, "").replace(/[\s\\]+/g, "");
+            const renderedContent = content(rendered);
+            const wantedContent = content(wanted);
+            let commonPrefixChars = 0;
+            while (commonPrefixChars < renderedContent.length
+              && renderedContent[commonPrefixChars] === wantedContent[commonPrefixChars]) commonPrefixChars += 1;
+            const fragment = freshConversation
+              && renderedContent.length >= 256
+              && wantedContent.includes(renderedContent);
+            return {
+              matches: fragment,
+              renderedChars: renderedContent.length,
+              submittedChars: wantedContent.length,
+              commonPrefixChars,
+            };
+          }, {
+            submitted: baseline.submittedText!,
+            freshConversation: baseline.initialTurnIdentities.length === 0,
+          }), signal));
+          matches = comparison.matches;
+          if (!matches) {
+            // Lengths only: the rendered and submitted text may be private.
+            console.error(`[chatgpt-web] detached response ownership mismatch ${JSON.stringify(comparison)}`);
+          }
+        }
+        // The accepted user identity (or the submitted text) establishes ownership.
         // Activity can replace its temporary group while still generating; requiring
         // a completed answer here mistakes that same unfinished turn for a foreign one.
       }

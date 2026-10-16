@@ -166,6 +166,55 @@ test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("an exchange rekeys only with
   } finally { await browser.close(); }
 }, 30_000);
 
+// Reported on 6.1.9: a 50-90k character prompt sent to a fresh temporary chat shows no user
+// bubble while generating (accepted by generation_running), then ChatGPT persists the exchange
+// under a new key with a connector pill and/or a collapsed bubble once the answer completes.
+test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("a persisted exchange without an observed user ID rebinds across rendered-only prompt differences", async () => {
+  const browser = await chromium.launch({ executablePath: process.env.CHATGPT_DOM_TEST_BROWSER, headless: true });
+  try {
+    const worker = Object.create(ChatGptBrowserWorker.prototype) as any;
+    const escape = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    const prompt = `Summarize the task.\n\n${"<context>line of accumulated state</context>\n".repeat(400)}Return the checkpoint.`;
+    const answer = '<div data-content-search-unit-key="persisted:assistant"><div data-conversation-role="assistant"></div><div data-markdown-text-style="assistant-message"><p>Checkpoint.</p></div></div><div class="turn-action-controls"><button>Copy</button></div>';
+    // The inline compaction transport: a fixed contract, then the context JSON in a code fence.
+    const fenced = `${"Contract sentence for the checkpoint.\n".repeat(60)}\`\`\`text\n<codex_context_json>\n${JSON.stringify({ messages: Array.from({ length: 200 }, (_, index) => `accumulated state ${index}:\n## ${index}\\. "done"`) })}\n</codex_context_json>\n\`\`\`\n<codex_transport_resume>\nProduce the checkpoint.\n</codex_transport_resume>`;
+    const paragraphs = (text: string) => text.split("\n\n").map(part => `<p>${escape(part).replace(/\n/g, "<br>")}</p>`).join("");
+    const bubble = (content: string) => `<div data-user-message-bubble><div data-search-result-target>${content}</div><button>Show more</button></div>`;
+    const cases = {
+      "connector-pill": [true, bubble(`<p><span data-prompt-link-href="app://test">Codex Native</span> ${paragraphs(prompt).slice(3)}`)],
+      "collapsed": [true, bubble(`<div style="white-space:pre-wrap">${escape(prompt.slice(0, 2000))}</div>`)],
+      "collapsed-with-history": [false, bubble(`<div style="white-space:pre-wrap">${escape(prompt.slice(0, 2000))}</div>`)],
+      "collapsed-divergent": [false, bubble(`<div style="white-space:pre-wrap">${escape(prompt.slice(0, 1999) + "X")}</div>`)],
+      "collapsed-too-short": [false, bubble(`<div style="white-space:pre-wrap">${escape(prompt.slice(0, 40))}</div>`)],
+      "longer": [false, bubble(`<div style="white-space:pre-wrap">${escape(prompt + " Another request.")}</div>`)],
+      "reworded": [false, bubble(`<div style="white-space:pre-wrap">${escape(prompt.slice(0, 2000).replace("accumulated", "different"))}</div>`)],
+      "fenced-context": [true, bubble(`<p>${escape(fenced.split("```text")[0]!.trim())}</p><pre><div>text</div><button>Copy code</button><code>${escape(fenced.split("```text\n")[1]!.slice(0, 3000))}</code></pre>`), fenced],
+      // Captured on 6.1.9: the composer doubles each backslash of the JSON-escaped context.
+      "escaped-backslashes": [true, bubble(`<div style="white-space:pre-wrap">${escape(fenced.slice(0, 3000).replaceAll("\\", "\\\\"))}</div>`), fenced],
+      // Captured on 6.1.9: a collapsed Full-mode turn shows the prompt's tail behind Show more.
+      "collapsed-tail": [true, bubble(`<div style="white-space:pre-wrap">${escape(fenced.slice(-1200))}</div>`), fenced],
+      "collapsed-tail-changed": [false, bubble(`<div style="white-space:pre-wrap">${escape(fenced.slice(-1200).replace("Produce", "Skip"))}</div>`), fenced],
+      "fenced-context-changed": [false, bubble(`<p>${escape(fenced.split("```text")[0]!.trim())}</p><pre><div>text</div><button>Copy code</button><code>${escape(fenced.split("```text\n")[1]!.slice(0, 3000).replace("state", "other"))}</code></pre>`), fenced],
+    } as const;
+    for (const [scenario, [accepted, user, submitted = prompt]] of Object.entries(cases) as [string, readonly [boolean, string, string?]][]) {
+      const page = await browser.newPage();
+      const history = scenario === "collapsed-with-history"
+        ? `<div data-turn-key="earlier">${bubble("Earlier")}${answer.replaceAll("persisted", "earlier")}</div>` : "";
+      await page.setContent(`<main>${history}</main>`);
+      const baseline = await worker.captureSubmissionBaseline(page, submitted);
+      await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, `${history}<div data-turn-key="optimistic"><span hidden data-chatgpt-agent-turn-start></span></div>`);
+      expect(await worker.currentSubmissionEvidence(page, baseline)).toBe("assistant_turn");
+      const binding = await worker.waitForNewAssistantTurn(page, baseline, Date.now() + 2000);
+      expect(binding.identity).toBe("group:assistant:optimistic");
+      await page.locator("main").evaluate((node, html) => { node.innerHTML = html; }, `${history}<div data-turn-key="persisted">${user}${answer}</div>`);
+      const result = worker.reconcileAssistantTurnBinding(page, baseline, binding);
+      if (accepted) expect((await result).identity).toBe("group:assistant:persisted");
+      else await expect(result).rejects.toThrow("another user turn");
+      await page.close();
+    }
+  } finally { await browser.close(); }
+}, 30_000);
+
 test.skipIf(!process.env.CHATGPT_DOM_TEST_BROWSER)("binds captured Activity before an answer exists and recognizes uploaded native-button tiles", async () => {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: request => new URL(request.url).pathname === "/backend-api/files/process_upload_stream"
     ? new Response(JSON.stringify({ event: "file.processing.completed", file_id: "fixture-file" }) + "\n", { headers: { "content-type": "application/x-ndjson" } })

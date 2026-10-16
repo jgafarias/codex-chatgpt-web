@@ -132,8 +132,16 @@ function sameAuthority(claim: ChatGptEnvironmentClaim, right: ChatGptTurnEnviron
     const expected = new Set(b.map(pathIdentity));
     return a.length === expected.size && a.every(path => expected.has(pathIdentity(path)));
   };
+  // Codex 0.163+ no longer records workspace_roots in turn_context, yet its envelope still lists
+  // granted output directories (e.g. visualizations) as roots. Such an extra root is accepted only
+  // when the rollout already grants it as a writable root, so it never expands authority.
+  const rolloutRoots = new Set(right.roots.map(pathIdentity));
+  const grantedRoots = new Set([...right.roots, ...right.writableRoots].map(pathIdentity));
+  const leftRoots = new Set(left.roots.map(pathIdentity));
+  const sameRoots = [...rolloutRoots].every(root => leftRoots.has(root))
+    && [...leftRoots].every(root => grantedRoots.has(root));
   return pathIdentity(left.cwd) === pathIdentity(right.cwd)
-    && samePaths(left.roots, right.roots)
+    && sameRoots
     // Filesystem envelopes can omit Codex's extra output directories. The current
     // native rollout remains the authority returned to the caller, never the claim.
     && (allowAdditionalWritableRoots

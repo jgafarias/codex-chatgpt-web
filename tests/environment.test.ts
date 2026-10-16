@@ -1378,6 +1378,42 @@ describe("trusted Codex task environment continuity", () => {
       .toThrow("Steering environment conflicts");
   });
 
+  // Codex 0.163 stopped recording workspace_roots in turn_context while its envelope still lists
+  // granted output directories as roots. Those roots must already be native writable grants.
+  test("steering accepts envelope roots that the rollout grants without declaring workspace roots", () => {
+    const { codexHome, request, body, rolloutPath, environment, auxiliary } = steeredRolloutFixture(false, []);
+    const output = join(codexHome, "visualizations", "current-task");
+    environment.content[1]!.text = environment.content[1]!.text.replace(
+      dangerFullAccessProfileXml, workspaceWriteProfileXml,
+    );
+    const metadata = JSON.parse(body.client_metadata["x-codex-turn-metadata"]!);
+    metadata.sandbox_mode = "workspace-write";
+    body.client_metadata["x-codex-turn-metadata"] = JSON.stringify(metadata);
+    const entries = [
+      { path: { type: "special", value: { kind: "root" } }, access: "read" },
+      ...[root, auxiliary, output].map(path => ({ path: { type: "path", path }, access: "write" })),
+      { path: { type: "special", value: { kind: "slash_tmp" } }, access: "write" },
+      { path: { type: "special", value: { kind: "tmpdir" } }, access: "write" },
+    ];
+    writeFileSync(rolloutPath, [
+      { type: "session_meta", payload: { id: rolloutThreadId, source: "vscode" } },
+      childTurnContext(rolloutTurnId, {
+        sandbox_policy: { type: "workspace-write", writable_roots: [auxiliary, output], network_access: false },
+        permission_profile: { type: "managed", file_system: { type: "restricted", entries }, network: "restricted" },
+        file_system_sandbox_policy: { kind: "restricted", entries },
+      }),
+    ].map(value => JSON.stringify(value)).join("\n") + "\n");
+
+    const actual = new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request);
+    expect(actual.writableRoots).toEqual([root, auxiliary, output]);
+
+    environment.content[1]!.text = environment.content[1]!.text.replace(
+      `<root>${auxiliary}</root>`, `<root>${resolve(root, "..", "unproven-root")}</root>`,
+    );
+    expect(() => new ChatGptThreadEnvironmentStore(undefined, Date.now, codexHome).resolve(request))
+      .toThrow("Steering environment conflicts");
+  });
+
   // #790. Codex 0.162 emits the same envelope with network access on or off: the permission
   // profile states filesystem access only, so the envelope cannot contradict the rollout here.
   for (const mode of ["workspace-write", "read-only"] as const) test(`${mode} uses one native network policy before and after steering`, async () => {
